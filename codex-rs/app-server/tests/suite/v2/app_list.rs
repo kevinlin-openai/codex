@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -27,9 +29,7 @@ use codex_app_server_protocol::AppReview;
 use codex_app_server_protocol::AppScreenshot;
 use codex_app_server_protocol::AppsListParams;
 use codex_app_server_protocol::AppsListResponse;
-use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::LoginAccountResponse;
-use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_config::types::AuthCredentialsStoreMode;
@@ -564,6 +564,73 @@ enabled = false
     assert_eq!(response_data.len(), 1);
     assert_eq!(response_data[0].id, "beta");
     assert!(!response_data[0].is_enabled);
+
+    server_handle.abort();
+    let _ = server_handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_apps_returns_accessible_apps_when_directory_is_unauthorized() -> Result<()> {
+    let tools = vec![connector_tool("linear", "Linear")?];
+    let (server_url, server_handle, server_control) = start_apps_server_with_delays_and_control(
+        Vec::new(),
+        tools,
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .await?;
+    server_control.reject_directory();
+
+    let codex_home = TempDir::new()?;
+    write_connectors_config(codex_home.path(), &server_url)?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .account_id("account-123")
+            .chatgpt_user_id("user-service-account")
+            .chatgpt_account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
+    let request_id = mcp
+        .send_apps_list_request(AppsListParams {
+            limit: None,
+            cursor: None,
+            thread_id: None,
+            force_refetch: false,
+        })
+        .await?;
+    let AppsListResponse { data, next_cursor } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+
+    assert_eq!(
+        data,
+        vec![AppInfo {
+            id: "linear".to_string(),
+            name: "Linear".to_string(),
+            description: None,
+            logo_url: None,
+            logo_url_dark: None,
+            icon_assets: None,
+            icon_dark_assets: None,
+            distribution_channel: None,
+            branding: None,
+            app_metadata: None,
+            labels: None,
+            install_url: Some("https://chatgpt.com/apps/linear/linear".to_string()),
+            is_accessible: true,
+            is_enabled: true,
+            plugin_display_names: Vec::new(),
+        }]
+    );
+    assert!(next_cursor.is_none());
 
     server_handle.abort();
     let _ = server_handle.await;
@@ -1130,7 +1197,7 @@ async fn list_apps_paginates_results() -> Result<()> {
 }
 
 #[tokio::test]
-async fn list_apps_force_refetch_preserves_previous_cache_on_failure() -> Result<()> {
+async fn list_apps_force_refetch_falls_back_and_preserves_directory_cache() -> Result<()> {
     let connectors = vec![AppInfo {
         id: "beta".to_string(),
         name: "Beta App".to_string(),
@@ -1149,8 +1216,13 @@ async fn list_apps_force_refetch_preserves_previous_cache_on_failure() -> Result
         plugin_display_names: Vec::new(),
     }];
     let tools = vec![connector_tool("beta", "Beta App")?];
-    let (server_url, server_handle) =
-        start_apps_server_with_delays(connectors, tools, Duration::ZERO, Duration::ZERO).await?;
+    let (server_url, server_handle, server_control) = start_apps_server_with_delays_and_control(
+        connectors,
+        tools,
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .await?;
 
     let codex_home = TempDir::new()?;
     write_connectors_config(codex_home.path(), &server_url)?;
@@ -1185,14 +1257,7 @@ async fn list_apps_force_refetch_preserves_previous_cache_on_failure() -> Result
     assert_eq!(initial_data.len(), 1);
     assert!(initial_data.iter().all(|app| app.is_accessible));
 
-    write_chatgpt_auth(
-        codex_home.path(),
-        ChatGptAuthFixture::new("chatgpt-token-invalid")
-            .account_id("account-123")
-            .chatgpt_user_id("user-123")
-            .chatgpt_account_id("account-123"),
-        AuthCredentialsStoreMode::File,
-    )?;
+    server_control.reject_directory();
 
     let refetch_request = mcp
         .send_apps_list_request(AppsListParams {
@@ -1202,12 +1267,31 @@ async fn list_apps_force_refetch_preserves_previous_cache_on_failure() -> Result
             force_refetch: true,
         })
         .await?;
-    let refetch_error: JSONRPCError = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(refetch_request)),
-    )
-    .await??;
-    assert!(refetch_error.error.message.contains("failed to"));
+    let AppsListResponse {
+        data: refetch_data,
+        next_cursor: refetch_next_cursor,
+    } = timeout(DEFAULT_TIMEOUT, mcp.read_response(refetch_request)).await??;
+    assert_eq!(
+        refetch_data,
+        vec![AppInfo {
+            id: "beta".to_string(),
+            name: "Beta App".to_string(),
+            description: None,
+            logo_url: None,
+            logo_url_dark: None,
+            icon_assets: None,
+            icon_dark_assets: None,
+            distribution_channel: None,
+            branding: None,
+            app_metadata: None,
+            labels: None,
+            install_url: Some("https://chatgpt.com/apps/beta-app/beta".to_string()),
+            is_accessible: true,
+            is_enabled: true,
+            plugin_display_names: Vec::new(),
+        }]
+    );
+    assert!(refetch_next_cursor.is_none());
 
     let cached_request = mcp
         .send_apps_list_request(AppsListParams {
@@ -1520,6 +1604,7 @@ struct AppsServerState {
     expected_bearer: String,
     expected_account_id: String,
     response: Arc<StdMutex<serde_json::Value>>,
+    reject_directory: Arc<AtomicBool>,
     directory_delay: Duration,
     workspace_plugins_enabled: bool,
 }
@@ -1540,9 +1625,14 @@ impl AppListMcpServer {
 struct AppsServerControl {
     response: Arc<StdMutex<serde_json::Value>>,
     tools: Arc<StdMutex<Vec<Tool>>>,
+    reject_directory: Arc<AtomicBool>,
 }
 
 impl AppsServerControl {
+    fn reject_directory(&self) {
+        self.reject_directory.store(true, Ordering::Relaxed);
+    }
+
     fn set_connectors(&self, connectors: Vec<AppInfo>) {
         let mut response_guard = self
             .response
@@ -1649,10 +1739,12 @@ async fn start_apps_server_with_delays_and_control_inner(
         json!({ "apps": connectors, "next_token": null }),
     ));
     let tools = Arc::new(StdMutex::new(tools));
+    let reject_directory = Arc::new(AtomicBool::new(false));
     let state = AppsServerState {
         expected_bearer: format!("Bearer {expected_bearer}"),
         expected_account_id: "account-123".to_string(),
         response: response.clone(),
+        reject_directory: reject_directory.clone(),
         directory_delay,
         workspace_plugins_enabled,
     };
@@ -1660,6 +1752,7 @@ async fn start_apps_server_with_delays_and_control_inner(
     let server_control = AppsServerControl {
         response,
         tools: tools.clone(),
+        reject_directory,
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1725,6 +1818,9 @@ async fn list_directory_connectors(
 ) -> Result<impl axum::response::IntoResponse, StatusCode> {
     if state.directory_delay > Duration::ZERO {
         tokio::time::sleep(state.directory_delay).await;
+    }
+    if state.reject_directory.load(Ordering::Relaxed) {
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
     let bearer_ok = headers

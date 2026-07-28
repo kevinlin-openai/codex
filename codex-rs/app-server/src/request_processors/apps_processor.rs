@@ -297,7 +297,11 @@ impl AppsRequestProcessor {
                     all_loaded = true;
                 }
                 AppListLoadResult::Directory(Err(err)) => {
-                    return Err(internal_error(err));
+                    warn!(
+                        "failed to load the app directory; returning accessible apps only: {err}"
+                    );
+                    all_connectors = None;
+                    all_loaded = true;
                 }
             }
 
